@@ -42,11 +42,16 @@
 		}
 	},
 	"permissions": [
-		"contextMenus", 
+		"contextMenus",
 		"activeTab",
 		"clipboardRead",
 		"storage",
 		"system.display"
+	],
+	"host_permissions": [
+		"https://www.youtube.com/*",
+		"https://youtube.com/*",
+		"https://youtu.be/*"
 	],
 	"content_security_policy": {
   		"extension_pages": "script-src 'self'; object-src 'self'"

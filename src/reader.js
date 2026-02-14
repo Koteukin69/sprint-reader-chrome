@@ -58,6 +58,7 @@ var colorGithubIcon;
 //		1 = history 1
 //		2 = history 2
 //		9 = clipboard
+//		10 = youtube video subtitles
 var selectedTextID = 0;
 
 // The slide tooltip which is created at init
@@ -245,6 +246,7 @@ function setDivVariables() {
         divMenuStepForward = document.getElementById("menuStepForward");
         divMenuLoadSelection = document.getElementById("menuLoadSelection");
         divMenuLoadClipboard = document.getElementById("menuLoadClipboard");
+        divMenuLoadYouTube = document.getElementById("menuLoadYouTube");
     }
 }
 
@@ -255,6 +257,7 @@ function setEventListeners() {
         $(document).bind("keypress", "q", bindQuit);
         $(document).bind("keypress", "r", bindReset);
         $(document).bind("keypress", "c", bindClipboardLoad);
+        $(document).bind("keypress", "y", bindYouTubeLoad);
         $(document).bind("keypress", "v", bindSelectionLoad);
 
         // Set all the event listeners for the extension
@@ -327,6 +330,16 @@ function setEventListeners() {
             "click",
             function () {
                 loadSelectedTextHistory(9);
+            },
+            false,
+        );
+
+        // play menu - load youtube subtitles
+        divLoadYouTube = document.getElementById("menuLoadYouTube");
+        divLoadYouTube.addEventListener(
+            "click",
+            function () {
+                loadSelectedTextHistory(10);
             },
             false,
         );
@@ -568,6 +581,11 @@ async function getSelectedTextHistoryFromLocal(historyid) {
             // Clipboard data
             selectedTextID = 9;
             text = await navigator.clipboard.readText();
+            break;
+        case 10:
+            // YouTube video subtitles from clipboard URL
+            selectedTextID = 10;
+            text = await fetchYouTubeSubtitlesFromClipboard();
             break;
     }
 
@@ -1569,6 +1587,223 @@ function bindClipboardLoad(k) {
     }
 }
 
+function bindYouTubeLoad(k) {
+    if (String.fromCharCode(k.keyCode) == "y") {
+        loadSelectedTextHistory(10);
+    }
+}
+
+// Extract a YouTube video ID from a URL string
+function extractYouTubeVideoID(url) {
+    if (!url) return null;
+    url = url.trim();
+    var patterns = [
+        /(?:youtube\.com\/watch\?.*v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+        var match = url.match(patterns[i]);
+        if (match && match[1]) return match[1];
+    }
+    return null;
+}
+
+// Fetch YouTube subtitles from a URL in the clipboard
+async function fetchYouTubeSubtitlesFromClipboard() {
+    try {
+        var clipboardText = await navigator.clipboard.readText();
+        var videoID = extractYouTubeVideoID(clipboardText);
+        if (!videoID) {
+            return "Error: No valid YouTube URL found in clipboard. Copy a YouTube video URL first.";
+        }
+
+        // Fetch the YouTube video page to extract caption track info
+        var videoURL = "https://www.youtube.com/watch?v=" + videoID;
+        var response = await fetch(videoURL);
+        if (!response.ok) {
+            return "Error: Failed to load YouTube video page (HTTP " + response.status + ").";
+        }
+
+        var html = await response.text();
+
+        // Extract captions data from ytInitialPlayerResponse
+        var captionsMatch = html.match(/"captions":\s*(\{.*?"playerCaptionsTracklistRenderer".*?\})\s*,\s*"videoDetails"/s);
+        if (!captionsMatch) {
+            // Try alternative pattern
+            captionsMatch = html.match(/"captionTracks":\s*(\[.*?\])/s);
+        }
+
+        var captionURL = null;
+        if (captionsMatch) {
+            // Try to find English captions first, then any available
+            var tracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/s);
+            if (tracksMatch) {
+                try {
+                    var tracks = JSON.parse(tracksMatch[1]);
+                    // Prefer English, then any manual caption, then auto-generated
+                    var englishTrack = null;
+                    var anyTrack = null;
+                    for (var i = 0; i < tracks.length; i++) {
+                        var track = tracks[i];
+                        if (!anyTrack) anyTrack = track;
+                        if (track.languageCode === "en" || track.languageCode === "en-US" || track.languageCode === "en-GB") {
+                            englishTrack = track;
+                            if (track.kind !== "asr") break; // Prefer manual over auto-generated
+                        }
+                    }
+                    var selectedTrack = englishTrack || anyTrack;
+                    if (selectedTrack && selectedTrack.baseUrl) {
+                        captionURL = selectedTrack.baseUrl;
+                    }
+                } catch (e) {
+                    // JSON parse failed, try regex extraction
+                }
+            }
+        }
+
+        if (!captionURL) {
+            // Fallback: try to extract baseUrl directly
+            var baseUrlMatch = html.match(/"captionTracks".*?"baseUrl"\s*:\s*"(.*?)"/s);
+            if (baseUrlMatch) {
+                captionURL = baseUrlMatch[1].replace(/\\u0026/g, "&");
+            }
+        }
+
+        if (!captionURL) {
+            return "Error: No subtitles/captions found for this video. The video may not have captions available.";
+        }
+
+        // Ensure proper URL decoding
+        captionURL = captionURL.replace(/\\u0026/g, "&");
+
+        // Fetch the captions XML
+        var captionResponse = await fetch(captionURL);
+        if (!captionResponse.ok) {
+            return "Error: Failed to fetch subtitle track (HTTP " + captionResponse.status + ").";
+        }
+
+        var captionXML = await captionResponse.text();
+        var formattedText = parseAndFormatCaptions(captionXML);
+        if (!formattedText || formattedText.trim() === "") {
+            return "Error: Subtitles were empty or could not be parsed.";
+        }
+
+        return formattedText;
+    } catch (error) {
+        return "Error loading YouTube subtitles: " + error.message;
+    }
+}
+
+// Parse YouTube caption XML and format into properly punctuated text
+function parseAndFormatCaptions(xml) {
+    var parser = new DOMParser();
+    var doc = parser.parseFromString(xml, "text/xml");
+    var textElements = doc.getElementsByTagName("text");
+
+    if (textElements.length === 0) return "";
+
+    // Extract all caption text segments
+    var segments = [];
+    for (var i = 0; i < textElements.length; i++) {
+        var raw = textElements[i].textContent || "";
+        // Decode HTML entities
+        var decoded = decodeHTMLEntities(raw);
+        // Clean up whitespace
+        decoded = decoded.replace(/\s+/g, " ").trim();
+        if (decoded.length > 0) {
+            segments.push(decoded);
+        }
+    }
+
+    // Join segments and format into proper text
+    var rawText = segments.join(" ");
+
+    // Remove duplicate spaces
+    rawText = rawText.replace(/\s+/g, " ").trim();
+
+    // YouTube auto-captions often have "[Music]", "[Applause]", etc. - keep them
+    // but clean up the text formatting
+
+    // If the text already has proper punctuation, return it mostly as-is
+    var hasPunctuation = /[.!?]/.test(rawText);
+
+    if (!hasPunctuation) {
+        // Auto-generated captions often lack punctuation entirely
+        // Add basic sentence breaks based on common patterns
+        rawText = addPunctuationToRawText(rawText);
+    }
+
+    // Capitalize after sentence endings
+    rawText = capitalizeAfterPunctuation(rawText);
+
+    // Capitalize first letter
+    if (rawText.length > 0) {
+        rawText = rawText.charAt(0).toUpperCase() + rawText.slice(1);
+    }
+
+    return rawText;
+}
+
+// Decode HTML entities in caption text
+function decodeHTMLEntities(text) {
+    var textarea = document.createElement("textarea");
+    textarea.innerHTML = text;
+    return textarea.value;
+}
+
+// Add basic punctuation to unpunctuated auto-generated captions
+function addPunctuationToRawText(text) {
+    // Split into words
+    var words = text.split(" ");
+    var result = [];
+    var wordCount = 0;
+
+    for (var i = 0; i < words.length; i++) {
+        var word = words[i];
+        result.push(word);
+        wordCount++;
+
+        // Add periods at natural break points
+        // Check for common sentence-ending patterns
+        var nextWord = (i + 1 < words.length) ? words[i + 1] : null;
+
+        // Add comma before conjunctions if sentence is getting long
+        if (wordCount > 5 && nextWord && /^(but|however|although|though|yet|so|because|since|while|whereas|and|or)$/i.test(nextWord)) {
+            var lastChar = word.charAt(word.length - 1);
+            if (!/[.,!?;:]/.test(lastChar)) {
+                result[result.length - 1] = word + ",";
+                wordCount = 0;
+            }
+        }
+        // Add period after roughly 15-25 words if no punctuation exists
+        else if (wordCount >= 18 && nextWord) {
+            var lastChar = word.charAt(word.length - 1);
+            if (!/[.,!?;:\-]/.test(lastChar)) {
+                // Look for a natural break point
+                if (/^(the|a|an|this|that|these|those|i|we|you|they|he|she|it|my|our|your|their|so|but|and|or|if|when|where|what|how|why|who|now|then|also|just)$/i.test(nextWord)) {
+                    result[result.length - 1] = word + ".";
+                    wordCount = 0;
+                }
+            }
+        }
+    }
+
+    // Add final period if missing
+    var finalText = result.join(" ");
+    var lastChar = finalText.charAt(finalText.length - 1);
+    if (!/[.!?]/.test(lastChar)) {
+        finalText = finalText + ".";
+    }
+
+    return finalText;
+}
+
+// Capitalize letters after sentence-ending punctuation
+function capitalizeAfterPunctuation(text) {
+    return text.replace(/([.!?]\s+)([a-z])/g, function (match, punct, letter) {
+        return punct + letter.toUpperCase();
+    });
+}
+
 // Sets up the slide tooltip
 function setupSlideTooltip() {
     if (listenersExist) return;
@@ -1906,7 +2141,7 @@ function displayStatusData() {
 // Set (and save) the selected text position
 // Usually executed when paused
 async function saveSelectedTextPosition() {
-    if (madvSaveSlidePosition !== true || selectedTextID === 9) {
+    if (madvSaveSlidePosition !== true || selectedTextID === 9 || selectedTextID === 10) {
         return;
     }
 
